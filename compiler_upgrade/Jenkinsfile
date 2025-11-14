@@ -1,0 +1,286 @@
+// Jenkins Pipeline for Building and Packaging Clang/LLVM Compiler
+// This pipeline automates the build process tested in phases 1-2
+
+pipeline {
+    agent {
+        label 'linux && x86_64'  // Ensure we run on x86_64 Linux nodes
+    }
+
+    parameters {
+        string(
+            name: 'CLANG_VERSION',
+            defaultValue: '17.0.3',
+            description: 'LLVM/Clang version to build (e.g., 17.0.3, 18.1.4, 21.1.0)'
+        )
+        string(
+            name: 'CLANG_SHA256',
+            defaultValue: 'be5a1e44d64f306bb44fce7d36e3b3993694e8e6122b2348608906283c176db8',
+            description: 'SHA256 checksum of llvm-project source tarball'
+        )
+        choice(
+            name: 'ARCHITECTURE',
+            choices: ['x86_64', 'aarch64'],
+            description: 'Target architecture to build for'
+        )
+        booleanParam(
+            name: 'UPLOAD_TO_S3',
+            defaultValue: false,
+            description: 'Upload the compiled archive to S3 after successful build'
+        )
+        booleanParam(
+            name: 'RUN_FROSTDB_TEST',
+            defaultValue: true,
+            description: 'Test the built compiler by building frostdb targets'
+        )
+    }
+
+    environment {
+        BUILD_DIR = "${WORKSPACE}/tmp/clang-build"
+        INSTALL_DIR = "${WORKSPACE}/tmp/clang-installed"
+        PACKAGE_DIR = "${WORKSPACE}/tmp/packages"
+        S3_BUCKET = 's3://sfc-eng-jenkins/foundationdb/bazel/toolchain/'
+
+        // Set number of CPUs for parallel build
+        CPUS = sh(script: 'getconf _NPROCESSORS_ONLN', returnStdout: true).trim()
+    }
+
+    options {
+        // Build timeout - clang build can take 1-2 hours
+        timeout(time: 3, unit: 'HOURS')
+
+        // Keep last 10 builds
+        buildDiscard(logRotator(numToKeepStr: '10'))
+
+        // Timestamps in console output
+        timestamps()
+    }
+
+    stages {
+        stage('Preparation') {
+            steps {
+                script {
+                    echo "Building Clang ${params.CLANG_VERSION} for ${params.ARCHITECTURE}"
+                    echo "Using ${env.CPUS} CPUs for parallel build"
+                    echo "Build directory: ${env.BUILD_DIR}"
+                    echo "Install directory: ${env.INSTALL_DIR}"
+                }
+
+                // Clean workspace
+                sh '''
+                    rm -rf ${BUILD_DIR} ${INSTALL_DIR} ${PACKAGE_DIR}
+                    mkdir -p ${BUILD_DIR} ${INSTALL_DIR} ${PACKAGE_DIR}
+                '''
+            }
+        }
+
+        stage('Build Clang from Source') {
+            steps {
+                script {
+                    echo "Starting Clang ${params.CLANG_VERSION} build..."
+
+                    // Copy build script to workspace
+                    sh '''
+                        cat > ${WORKSPACE}/build_clang.sh << 'EOF'
+#!/bin/bash -ex
+
+CLANG_VERSION="${CLANG_VERSION}"
+CLANG_PROJECT_SHA="${CLANG_SHA256}"
+BUILD_DIR="${BUILD_DIR}"
+INSTALL_DIR="${INSTALL_DIR}"
+CPUS="${CPUS}"
+
+# Use devtoolset-11 for GCC 11+
+if [ -f /opt/rh/devtoolset-11/enable ]; then
+    source /opt/rh/devtoolset-11/enable
+    export CC=gcc
+    export CXX=g++
+fi
+
+# Download LLVM source
+mkdir -p ${BUILD_DIR}/dl
+cd ${BUILD_DIR}/dl
+TAR_NAME=llvm-project-${CLANG_VERSION}.src.tar.xz
+
+curl -L https://artifactory.int.snowflakecomputing.com/artifactory/development-github-virtual/llvm/llvm-project/releases/download/llvmorg-${CLANG_VERSION}/${TAR_NAME} -o ${TAR_NAME}
+
+# Validate checksum
+SIG_CMP=$(sha256sum ${TAR_NAME} | cut -d ' ' -f1)
+if [ "$SIG_CMP" != "${CLANG_PROJECT_SHA}" ]; then
+    echo "ERROR: SHA256 mismatch"
+    echo "Expected: ${CLANG_PROJECT_SHA}"
+    echo "Got: ${SIG_CMP}"
+    exit 1
+fi
+
+# Unpack source
+cd ${BUILD_DIR}
+tar xf dl/${TAR_NAME}
+mv llvm-project-${CLANG_VERSION}.src src
+rm -rf dl
+
+# Detect target architecture
+target=X86
+if [ $(uname -m) == aarch64 ]; then
+    target=AArch64
+fi
+
+# Configure and build
+mkdir -p ${BUILD_DIR}/build
+cd ${BUILD_DIR}/build
+
+cmake \
+    -DCMAKE_C_COMPILER=${CC} \
+    -DCMAKE_CXX_COMPILER=${CXX} \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=${INSTALL_DIR} \
+    -DLLVM_ENABLE_PROJECTS="clang;clang-tools-extra;lld;lldb" \
+    -DLLVM_ENABLE_RUNTIMES="compiler-rt;libcxx;libcxxabi;libunwind" \
+    -DCLANG_INCLUDE_DOCS=OFF \
+    -DCLANG_INCLUDE_TESTS=OFF \
+    -DLLVM_INCLUDE_DOCS=OFF \
+    -DLLVM_INCLUDE_EXAMPLES=OFF \
+    -DLLVM_INCLUDE_TESTS=OFF \
+    -DCLANG_DEFAULT_PIE_ON_LINUX=OFF \
+    -DLLVM_STATIC_LINK_CXX_STDLIB=ON \
+    -DLLVM_TARGETS_TO_BUILD="$target" \
+    ../src/llvm \
+    -GNinja
+
+ninja -j ${CPUS} install/strip FileCheck
+cp bin/FileCheck ${INSTALL_DIR}/bin/
+
+# Create patch signature
+echo "# No patches applied" > ${INSTALL_DIR}/sf_patch.signature
+
+echo "Build completed successfully!"
+EOF
+                        chmod +x ${WORKSPACE}/build_clang.sh
+                        ${WORKSPACE}/build_clang.sh
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Build') {
+            steps {
+                script {
+                    echo "Verifying built compiler..."
+                    sh '''
+                        # Check clang binary exists and works
+                        ${INSTALL_DIR}/bin/clang --version
+
+                        # Verify expected structure
+                        for dir in bin lib include; do
+                            if [ ! -d "${INSTALL_DIR}/${dir}" ]; then
+                                echo "ERROR: Missing directory: ${dir}"
+                                exit 1
+                            fi
+                        done
+
+                        # Count files
+                        FILE_COUNT=$(find ${INSTALL_DIR} -type f | wc -l)
+                        echo "Total files in build: ${FILE_COUNT}"
+
+                        # Verify runtime libraries exist
+                        if [ ! -d "${INSTALL_DIR}/lib/x86_64-unknown-linux-gnu" ] && [ ! -d "${INSTALL_DIR}/lib/aarch64-unknown-linux-gnu" ]; then
+                            echo "ERROR: Runtime libraries directory not found"
+                            exit 1
+                        fi
+
+                        echo "Build verification passed!"
+                    '''
+                }
+            }
+        }
+
+        stage('Test with Frostdb') {
+            when {
+                expression { params.RUN_FROSTDB_TEST }
+            }
+            steps {
+                script {
+                    echo "Testing compiler with frostdb build..."
+                    sh '''
+                        # Clone frostdb if not already present
+                        if [ ! -d "${WORKSPACE}/frostdb" ]; then
+                            git clone <frostdb-repo-url> ${WORKSPACE}/frostdb
+                        fi
+
+                        cd ${WORKSPACE}/frostdb
+
+                        # Update MODULE.bazel to use locally-built compiler
+                        # (Implementation depends on your testing strategy)
+
+                        # Test build
+                        bazel build //contrib/crc32/... --verbose_failures
+
+                        echo "Frostdb test build passed!"
+                    '''
+                }
+            }
+        }
+
+        stage('Package Compiler') {
+            steps {
+                script {
+                    echo "Packaging compiler archive..."
+                    sh '''
+                        USERNAME=${USER}
+                        TIMESTAMP=$(date +%s)
+                        ARCHIVE_NAME="clang-${CLANG_VERSION}-${ARCHITECTURE}-${USERNAME}-${TIMESTAMP}.tgz"
+
+                        cd ${INSTALL_DIR}/..
+                        tar czf ${PACKAGE_DIR}/${ARCHIVE_NAME} $(basename ${INSTALL_DIR})
+
+                        # Calculate SHA256
+                        cd ${PACKAGE_DIR}
+                        SHA256=$(sha256sum ${ARCHIVE_NAME} | cut -d' ' -f1)
+
+                        echo "Archive: ${ARCHIVE_NAME}" > ${PACKAGE_DIR}/build_info.txt
+                        echo "SHA256: ${SHA256}" >> ${PACKAGE_DIR}/build_info.txt
+                        echo "Version: ${CLANG_VERSION}" >> ${PACKAGE_DIR}/build_info.txt
+                        echo "Architecture: ${ARCHITECTURE}" >> ${PACKAGE_DIR}/build_info.txt
+
+                        cat ${PACKAGE_DIR}/build_info.txt
+                    '''
+                }
+            }
+        }
+
+        stage('Upload to S3') {
+            when {
+                expression { params.UPLOAD_TO_S3 }
+            }
+            steps {
+                script {
+                    echo "Uploading to S3..."
+                    sh '''
+                        ARCHIVE=$(ls ${PACKAGE_DIR}/*.tgz)
+                        aws s3 cp ${ARCHIVE} ${S3_BUCKET}
+                        echo "Upload complete: ${S3_BUCKET}$(basename ${ARCHIVE})"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                echo "✅ Clang ${params.CLANG_VERSION} build completed successfully!"
+                archiveArtifacts artifacts: 'tmp/packages/*', fingerprint: true
+            }
+        }
+        failure {
+            script {
+                echo "❌ Clang build failed!"
+            }
+        }
+        always {
+            // Clean up large build directories to save disk space
+            sh '''
+                rm -rf ${BUILD_DIR}
+            '''
+        }
+    }
+}
