@@ -20,14 +20,20 @@ CPUS=${CPUS:-$(getconf _NPROCESSORS_ONLN)}
 SCRIPTPATH="$(cd "$(dirname "$0")" && pwd -P)"
 
 # Which compiler to use for bootstrap
-# Use devtoolset-11 if available (provides GCC 11.2.1), otherwise system compiler
-if [ -f /opt/rh/devtoolset-11/enable ]; then
+# Use devtoolset-11 if available (provides GCC 11.2.1), fallback to devtoolset-10 (GCC 10.2.1)
+# Note: devtoolset-11 on aarch64 only has binutils, not gcc
+if [ -f /opt/rh/devtoolset-11/enable ] && [ -f /opt/rh/devtoolset-11/root/usr/bin/gcc ]; then
   echo "Using devtoolset-11 for bootstrap compiler"
   source /opt/rh/devtoolset-11/enable
   export CC=gcc
   export CXX=g++
+elif [ -f /opt/rh/devtoolset-10/enable ]; then
+  echo "Using devtoolset-10 for bootstrap compiler"
+  source /opt/rh/devtoolset-10/enable
+  export CC=gcc
+  export CXX=g++
 else
-  echo "Warning: devtoolset-11 not found, using system compiler"
+  echo "Warning: devtoolset not found, using system compiler"
   export CC=${CC:-gcc}
   export CXX=${CXX:-g++}
 fi
